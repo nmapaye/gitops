@@ -1,0 +1,15 @@
+namespace: canary-system
+image:
+  repository: ghcr.io/example/canary-operator
+  tag: latest
+  pullPolicy: IfNotPresent
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+prometheus:
+  url: http://prometheus-server.monitoring.svc.cluster.local:9090
+

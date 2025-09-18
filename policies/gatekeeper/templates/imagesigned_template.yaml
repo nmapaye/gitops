@@ -1,0 +1,44 @@
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8simagesigned
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sImageSigned
+      validation:
+        openAPIV3Schema:
+          properties:
+            requireDigest:
+              type: boolean
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8simagesigned
+
+        violation[{
+          "msg": msg,
+          "details": {"image": img}
+        }] {
+          input.review.kind.kind == "Pod" or input.review.kind.kind == "Deployment"
+          img := images[_]
+          not has_digest(img)
+          msg := sprintf("image %s must be pinned by digest (enforced for signing)", [img])
+        }
+
+        images[img] {
+          input.review.kind.kind == "Pod"
+          c := input.review.object.spec.containers[_]
+          img := c.image
+        }
+        images[img] {
+          input.review.kind.kind == "Deployment"
+          c := input.review.object.spec.template.spec.containers[_]
+          img := c.image
+        }
+
+        has_digest(img) {
+          contains(img, "@sha256:")
+        }
+

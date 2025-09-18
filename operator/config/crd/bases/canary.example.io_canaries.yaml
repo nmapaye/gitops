@@ -1,0 +1,81 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: canaries.canary.example.io
+spec:
+  group: canary.example.io
+  names:
+    kind: Canary
+    listKind: CanaryList
+    plural: canaries
+    singular: canary
+    shortNames:
+      - cnry
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                targetRef:
+                  type: string
+                stableService:
+                  type: string
+                canaryService:
+                  type: string
+                steps:
+                  type: array
+                  items:
+                    type: integer
+                stepInterval:
+                  type: string
+                slo:
+                  type: object
+                  properties:
+                    prometheusURL:
+                      type: string
+                    p95LatencyQuery:
+                      type: string
+                    errorRateQuery:
+                      type: string
+                    p95LatencyMsMax:
+                      type: number
+                    errorRateMax:
+                      type: number
+                abort:
+                  type: object
+                  properties:
+                    minErrorBudgetPercent:
+                      type: number
+                    maxP95IncreaseMs:
+                      type: number
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                currentStepIndex:
+                  type: integer
+                currentWeight:
+                  type: integer
+                lastTransition:
+                  type: string
+                message:
+                  type: string
+                errorBudgetRemaining:
+                  type: number
+                p95LatencyMs:
+                  type: number
+                errorRate:
+                  type: number
+                baselineP95Ms:
+                  type: number
+      subresources:
+        status: {}
+

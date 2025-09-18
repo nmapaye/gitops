@@ -1,0 +1,6 @@
+{{- /* Allow installing the CRD alongside the operator for convenience */ -}}
+{{- $crd := .Files.Get "files/canary.example.io_canaries.yaml" -}}
+{{- if $crd }}
+{{ $crd }}
+{{- end }}
+

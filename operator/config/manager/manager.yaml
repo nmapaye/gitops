@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-operator
+  namespace: canary-system
+labels:
+  app.kubernetes.io/name: canary-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: canary-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: canary-operator
+    spec:
+      serviceAccountName: canary-operator
+      containers:
+        - name: manager
+          image: ghcr.io/example/canary-operator:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect
+          ports:
+            - containerPort: 8080
+              name: metrics
+            - containerPort: 8081
+              name: healthz
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: healthz
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: canary-operator
+  namespace: canary-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: canary-operator-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: canary-operator-role
+subjects:
+  - kind: ServiceAccount
+    name: canary-operator
+    namespace: canary-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: canary-system
+

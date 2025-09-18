@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-operator
+  namespace: canary-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          image: ghcr.io/example/canary-operator:stage
+          env:
+            - name: PROMETHEUS_URL
+              value: http://prometheus.monitoring.svc.cluster.local:9090
+          resources:
+            limits:
+              cpu: 300m
+              memory: 384Mi
+            requests:
+              cpu: 150m
+              memory: 192Mi
+

@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: canary-operator
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: canary-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: canary-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: canary-operator
+    spec:
+      serviceAccountName: canary-operator
+      containers:
+        - name: manager
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --leader-elect
+          ports:
+            - containerPort: 8080
+              name: metrics
+            - containerPort: 8081
+              name: healthz
+          env:
+            - name: PROMETHEUS_URL
+              value: {{ .Values.prometheus.url | quote }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: healthz
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+

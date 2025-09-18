@@ -1,0 +1,28 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: canary-operator-role
+rules:
+  - apiGroups: ["canary.example.io"]
+    resources: ["canaries", "canaries/status"]
+    verbs: ["get","list","watch","create","update","patch","delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create","patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get","list","watch","update","patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: canary-operator-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: canary-operator-role
+subjects:
+  - kind: ServiceAccount
+    name: canary-operator
+    namespace: {{ .Values.namespace }}
+

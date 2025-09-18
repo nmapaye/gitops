@@ -1,0 +1,23 @@
+apiVersion: canary.example.io/v1alpha1
+kind: Canary
+metadata:
+  name: myapp
+  namespace: default
+spec:
+  targetRef: myapp
+  stableService: myapp-stable
+  canaryService: myapp-canary
+  steps: [10, 50, 100]
+  stepInterval: 30s
+  slo:
+    prometheusURL: http://prometheus-server.monitoring.svc.cluster.local:9090
+    p95LatencyQuery: |
+      histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="app"}[5m])) by (le)) * 1000
+    errorRateQuery: |
+      sum(rate(http_requests_total{job="app",code=~"5.."}[5m])) / sum(rate(http_requests_total{job="app"}[5m]))
+    p95LatencyMsMax: 300
+    errorRateMax: 0.02
+  abort:
+    minErrorBudgetPercent: 10
+    maxP95IncreaseMs: 100
+

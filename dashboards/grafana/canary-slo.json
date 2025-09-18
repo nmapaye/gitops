@@ -1,0 +1,24 @@
+{
+  "title": "Canary SLO",
+  "schemaVersion": 36,
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "p95 latency (ms)",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=\"app\"}[5m])) by (le)) * 1000"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Error rate",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "sum(rate(http_requests_total{job=\"app\",code=~\"5..\"}[5m])) / sum(rate(http_requests_total{job=\"app\"}[5m]))"}
+      ]
+    }
+  ]
+}
+
