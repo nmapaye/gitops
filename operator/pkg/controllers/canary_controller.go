@@ -1,235 +1,439 @@
 package controllers
 
 import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "os"
-    "net/http"
-    "net/url"
-    "strconv"
-    "time"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"time"
 
-    canaryv1 "github.com/example/canary-operator/pkg/apis/canary/v1alpha1"
-    corev1 "k8s.io/api/core/v1"
-    apierrors "k8s.io/apimachinery/pkg/api/errors"
-    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    "k8s.io/apimachinery/pkg/runtime"
-    "k8s.io/apimachinery/pkg/types"
-    ctrl "sigs.k8s.io/controller-runtime"
-    "sigs.k8s.io/controller-runtime/pkg/client"
-    "sigs.k8s.io/controller-runtime/pkg/controller"
-    "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-    "sigs.k8s.io/controller-runtime/pkg/log"
+	canaryv1 "github.com/example/canary-operator/pkg/apis/canary/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+const (
+	defaultStepInterval = 30 * time.Second
+	longRequeue         = 2 * time.Minute
+)
+
+var defaultSteps = []int{10, 50, 100}
+
 type CanaryReconciler struct {
-    client.Client
-    Scheme     *runtime.Scheme
-    Recorder   ctrl.EventRecorder
-    HTTPClient *http.Client
+	client.Client
+	Scheme     *runtime.Scheme
+	Recorder   record.EventRecorder
+	HTTPClient *http.Client
+	Now        func() time.Time
 }
 
-// RBAC permissions
 // +kubebuilder:rbac:groups=canary.example.io,resources=canaries,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=canary.example.io,resources=canaries/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;update;patch
 
 func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-    logger := log.FromContext(ctx)
-    cn := &canaryv1.Canary{}
-    if err := r.Get(ctx, req.NamespacedName, cn); err != nil {
-        if apierrors.IsNotFound(err) {
-            return ctrl.Result{}, nil
-        }
-        return ctrl.Result{}, err
-    }
+	logger := log.FromContext(ctx)
+	cn := &canaryv1.Canary{}
+	if err := r.Get(ctx, req.NamespacedName, cn); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
 
-    // Defaulting
-    if len(cn.Spec.Steps) == 0 {
-        cn.Spec.Steps = []int{10, 50, 100}
-    }
-    if cn.Spec.StepInterval.Duration == 0 {
-        cn.Spec.StepInterval = metav1.Duration{Duration: 30 * time.Second}
-    }
+	steps := effectiveSteps(cn.Spec.Steps)
+	interval := effectiveInterval(cn.Spec.StepInterval.Duration)
+	if err := validateSpec(cn, steps, interval); err != nil {
+		cn.Status.Phase = "Invalid"
+		cn.Status.Message = err.Error()
+		cn.Status.ObservedGeneration = cn.Generation
+		cn.Status.LastTransition = metav1.NewTime(r.now())
+		setCondition(cn, metav1.ConditionFalse, "InvalidSpec", err.Error())
+		if statusErr := r.Status().Update(ctx, cn); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		r.eventf(cn, corev1.EventTypeWarning, "InvalidSpec", "%v", err)
+		return ctrl.Result{}, nil
+	}
 
-    // Initialize status
-    if cn.Status.Phase == "" {
-        cn.Status.Phase = "Pending"
-        cn.Status.LastTransition = metav1.Now()
-        if err := r.Status().Update(ctx, cn); err != nil {
-            return ctrl.Result{}, err
-        }
-        return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-    }
+	if cn.Status.ObservedGeneration != 0 && cn.Status.ObservedGeneration != cn.Generation {
+		cn.Status = canaryv1.CanaryStatus{Phase: "Pending", LastTransition: metav1.NewTime(r.now())}
+	}
+	cn.Status.ObservedGeneration = cn.Generation
 
-    // Fetch SLO metrics from Prometheus
-    p95, errRate, err := r.fetchSLOs(ctx, cn)
-    if err != nil {
-        logger.Error(err, "failed fetching SLO metrics")
-        r.Recorder.Eventf(cn, corev1.EventTypeWarning, "PromQueryError", "Failed to fetch SLOs: %v", err)
-        // transient error, retry with rate limiter
-        return ctrl.Result{}, err
-    }
-    cn.Status.P95LatencyMs = p95
-    cn.Status.ErrorRate = errRate
+	if cn.Status.Phase == "" {
+		cn.Status.Phase = "Pending"
+		cn.Status.LastTransition = metav1.NewTime(r.now())
+		cn.Status.Message = "Waiting for initial SLO sample"
+		setCondition(cn, metav1.ConditionFalse, "Pending", cn.Status.Message)
+		if err := r.Status().Update(ctx, cn); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
 
-    // Compute a simplistic error budget remaining (1 - errorRate/errorRateMax)
-    if cn.Spec.SLO.ErrorRateMax > 0 {
-        rem := 1 - (errRate / cn.Spec.SLO.ErrorRateMax)
-        if rem < 0 {
-            rem = 0
-        }
-        cn.Status.ErrorBudgetRem = rem * 100
-    }
+	p95, errRate, err := r.fetchSLOs(ctx, cn)
+	if err != nil {
+		logger.Error(err, "failed fetching SLO metrics")
+		cn.Status.Message = "Prometheus query failed"
+		setCondition(cn, metav1.ConditionFalse, "PromQueryError", cn.Status.Message)
+		if statusErr := r.Status().Update(ctx, cn); statusErr != nil {
+			return ctrl.Result{}, errors.Join(err, statusErr)
+		}
+		r.eventf(cn, corev1.EventTypeWarning, "PromQueryError", "Failed to fetch SLOs: %v", err)
+		return ctrl.Result{}, err
+	}
+	cn.Status.P95LatencyMs = p95
+	cn.Status.ErrorRate = errRate
+	if !cn.Status.BaselineCaptured {
+		cn.Status.BaselineP95Ms = p95
+		cn.Status.BaselineCaptured = true
+	}
+	cn.Status.ErrorBudgetRem = errorBudgetRemaining(errRate, cn.Spec.SLO.ErrorRateMax)
 
-    // Decide next action
-    // Abort if SLOs breached
-    if (cn.Spec.SLO.P95LatencyMsMax > 0 && p95 > cn.Spec.SLO.P95LatencyMsMax) ||
-        (cn.Spec.SLO.ErrorRateMax > 0 && errRate > cn.Spec.SLO.ErrorRateMax) ||
-        (cn.Spec.Abort.MinErrorBudgetPercent > 0 && cn.Status.ErrorBudgetRem < cn.Spec.Abort.MinErrorBudgetPercent) {
-        // rollback
-        if err := r.applyServiceWeights(ctx, cn, 100, 0); err != nil {
-            return ctrl.Result{}, err
-        }
-        cn.Status.Phase = "Failed"
-        cn.Status.Message = fmt.Sprintf("Rollback: p95=%.2fms errRate=%.4f", p95, errRate)
-        cn.Status.LastTransition = metav1.Now()
-        r.Recorder.Eventf(cn, corev1.EventTypeWarning, "Rollback", cn.Status.Message)
-        if err := r.Status().Update(ctx, cn); err != nil {
-            return ctrl.Result{}, err
-        }
-        // stop reconciling aggressively; next updates will be via changes
-        return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
-    }
+	if reason, breached := breachReason(cn, p95, errRate); breached {
+		if err := r.applyServiceWeights(ctx, cn, 100, 0); err != nil {
+			cn.Status.Message = fmt.Sprintf("Rollback failed after SLO breach: %v", err)
+			setCondition(cn, metav1.ConditionFalse, "RollbackFailed", cn.Status.Message)
+			if statusErr := r.Status().Update(ctx, cn); statusErr != nil {
+				return ctrl.Result{}, errors.Join(err, statusErr)
+			}
+			return ctrl.Result{}, err
+		}
+		cn.Status.Phase = "Failed"
+		cn.Status.CurrentWeight = 0
+		cn.Status.Message = "Rollback: " + reason
+		cn.Status.LastTransition = metav1.NewTime(r.now())
+		setCondition(cn, metav1.ConditionFalse, "SLOBreach", cn.Status.Message)
+		r.eventf(cn, corev1.EventTypeWarning, "Rollback", "%s", cn.Status.Message)
+		if err := r.Status().Update(ctx, cn); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: longRequeue}, nil
+	}
 
-    // Progress or finish
-    if cn.Status.CurrentStepIndex >= len(cn.Spec.Steps) {
-        // already finished
-        cn.Status.Phase = "Succeeded"
-        cn.Status.Message = "Reached final weight"
-        cn.Status.LastTransition = metav1.Now()
-        _ = r.Status().Update(ctx, cn)
-        return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
-    }
+	if cn.Status.Phase == "Failed" || cn.Status.Phase == "Succeeded" {
+		setCondition(cn, conditionStatus(cn.Status.Phase == "Succeeded"), cn.Status.Phase, cn.Status.Message)
+		if err := r.Status().Update(ctx, cn); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: longRequeue}, nil
+	}
 
-    // Apply next weight
-    targetWeight := cn.Spec.Steps[cn.Status.CurrentStepIndex]
-    if err := r.applyServiceWeights(ctx, cn, 100-targetWeight, targetWeight); err != nil {
-        return ctrl.Result{}, err
-    }
-    cn.Status.CurrentWeight = targetWeight
-    cn.Status.Phase = "Progressing"
-    cn.Status.Message = fmt.Sprintf("Shifted canary to %d%%", targetWeight)
-    cn.Status.LastTransition = metav1.Now()
-    r.Recorder.Eventf(cn, corev1.EventTypeNormal, "Progress", cn.Status.Message)
-    if err := r.Status().Update(ctx, cn); err != nil {
-        return ctrl.Result{}, err
-    }
+	if cn.Status.Phase == "Progressing" {
+		nextStepAt := cn.Status.LastTransition.Time.Add(interval)
+		if remaining := nextStepAt.Sub(r.now()); remaining > 0 {
+			setCondition(cn, metav1.ConditionFalse, "WaitingForStep", "Waiting for the configured step interval")
+			if err := r.Status().Update(ctx, cn); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: remaining}, nil
+		}
+	}
 
-    // Move to next step on next reconcile
-    if targetWeight == 100 {
-        cn.Status.Phase = "Succeeded"
-        cn.Status.Message = "Canary completed"
-        _ = r.Status().Update(ctx, cn)
-        return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
-    }
-    cn.Status.CurrentStepIndex++
-    _ = r.Status().Update(ctx, cn)
-    return ctrl.Result{RequeueAfter: cn.Spec.StepInterval.Duration}, nil
+	if cn.Status.CurrentStepIndex >= len(steps) {
+		cn.Status.Phase = "Succeeded"
+		cn.Status.Message = "Reached final weight"
+		cn.Status.LastTransition = metav1.NewTime(r.now())
+		setCondition(cn, metav1.ConditionTrue, "Succeeded", cn.Status.Message)
+		if err := r.Status().Update(ctx, cn); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: longRequeue}, nil
+	}
+
+	targetWeight := steps[cn.Status.CurrentStepIndex]
+	if err := r.applyServiceWeights(ctx, cn, 100-targetWeight, targetWeight); err != nil {
+		cn.Status.Message = fmt.Sprintf("Traffic update failed: %v", err)
+		setCondition(cn, metav1.ConditionFalse, "TrafficUpdateFailed", cn.Status.Message)
+		if statusErr := r.Status().Update(ctx, cn); statusErr != nil {
+			return ctrl.Result{}, errors.Join(err, statusErr)
+		}
+		return ctrl.Result{}, err
+	}
+
+	cn.Status.CurrentWeight = targetWeight
+	cn.Status.CurrentStepIndex++
+	cn.Status.LastTransition = metav1.NewTime(r.now())
+	if targetWeight == 100 {
+		cn.Status.Phase = "Succeeded"
+		cn.Status.Message = "Canary completed"
+		setCondition(cn, metav1.ConditionTrue, "Succeeded", cn.Status.Message)
+	} else {
+		cn.Status.Phase = "Progressing"
+		cn.Status.Message = fmt.Sprintf("Shifted canary to %d%%", targetWeight)
+		setCondition(cn, metav1.ConditionFalse, "Progressing", cn.Status.Message)
+	}
+	r.eventf(cn, corev1.EventTypeNormal, "Progress", "%s", cn.Status.Message)
+	if err := r.Status().Update(ctx, cn); err != nil {
+		return ctrl.Result{}, err
+	}
+	if targetWeight == 100 {
+		return ctrl.Result{RequeueAfter: longRequeue}, nil
+	}
+	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
-// applyServiceWeights updates annotations on the stable/canary Services to indicate desired traffic weights.
-// A service mesh or ingress controller can read these annotations to route traffic accordingly.
+func effectiveSteps(configured []int) []int {
+	if len(configured) == 0 {
+		return append([]int(nil), defaultSteps...)
+	}
+	return append([]int(nil), configured...)
+}
+
+func effectiveInterval(configured time.Duration) time.Duration {
+	if configured == 0 {
+		return defaultStepInterval
+	}
+	return configured
+}
+
+func validateSpec(cn *canaryv1.Canary, steps []int, interval time.Duration) error {
+	if cn.Spec.TargetRef == "" {
+		return errors.New("targetRef is required")
+	}
+	if cn.Spec.StableService == "" || cn.Spec.CanaryService == "" {
+		return errors.New("stableService and canaryService are required")
+	}
+	if cn.Spec.StableService == cn.Spec.CanaryService {
+		return errors.New("stableService and canaryService must differ")
+	}
+	if interval <= 0 {
+		return errors.New("stepInterval must be positive")
+	}
+	previous := 0
+	for _, step := range steps {
+		if step < 1 || step > 100 {
+			return fmt.Errorf("step %d must be between 1 and 100", step)
+		}
+		if step <= previous {
+			return errors.New("steps must be strictly increasing")
+		}
+		previous = step
+	}
+	if len(steps) == 0 || steps[len(steps)-1] != 100 {
+		return errors.New("steps must end at 100")
+	}
+	if cn.Spec.SLO.P95LatencyMsMax < 0 || cn.Spec.SLO.ErrorRateMax < 0 || cn.Spec.SLO.ErrorRateMax > 1 {
+		return errors.New("SLO limits must be non-negative and errorRateMax cannot exceed 1")
+	}
+	if cn.Spec.Abort.MinErrorBudgetPercent < 0 || cn.Spec.Abort.MinErrorBudgetPercent > 100 || cn.Spec.Abort.MaxP95IncreaseMs < 0 {
+		return errors.New("abort limits must be non-negative and percentages cannot exceed 100")
+	}
+	if cn.Spec.SLO.P95LatencyMsMax > 0 && cn.Spec.SLO.P95LatencyQuery == "" {
+		return errors.New("p95LatencyQuery is required when p95LatencyMsMax is set")
+	}
+	if cn.Spec.SLO.ErrorRateMax > 0 && cn.Spec.SLO.ErrorRateQuery == "" {
+		return errors.New("errorRateQuery is required when errorRateMax is set")
+	}
+	return nil
+}
+
+func errorBudgetRemaining(errorRate, maximum float64) float64 {
+	if maximum <= 0 {
+		return 100
+	}
+	remaining := (1 - errorRate/maximum) * 100
+	if remaining < 0 {
+		return 0
+	}
+	if remaining > 100 {
+		return 100
+	}
+	return remaining
+}
+
+func breachReason(cn *canaryv1.Canary, p95, errorRate float64) (string, bool) {
+	if max := cn.Spec.SLO.P95LatencyMsMax; max > 0 && p95 > max {
+		return fmt.Sprintf("p95 %.2fms exceeds %.2fms", p95, max), true
+	}
+	if max := cn.Spec.SLO.ErrorRateMax; max > 0 && errorRate > max {
+		return fmt.Sprintf("error rate %.4f exceeds %.4f", errorRate, max), true
+	}
+	if min := cn.Spec.Abort.MinErrorBudgetPercent; min > 0 && cn.Status.ErrorBudgetRem < min {
+		return fmt.Sprintf("error budget %.2f%% is below %.2f%%", cn.Status.ErrorBudgetRem, min), true
+	}
+	if maxIncrease := cn.Spec.Abort.MaxP95IncreaseMs; cn.Status.BaselineCaptured && maxIncrease > 0 && p95-cn.Status.BaselineP95Ms > maxIncrease {
+		return fmt.Sprintf("p95 increased %.2fms over baseline", p95-cn.Status.BaselineP95Ms), true
+	}
+	return "", false
+}
+
+type annotationValue struct {
+	value   string
+	present bool
+}
+
 func (r *CanaryReconciler) applyServiceWeights(ctx context.Context, cn *canaryv1.Canary, stableWeight, canaryWeight int) error {
-    // Helper to patch one service
-    patchSvc := func(name string, weight int) error {
-        if name == "" {
-            return nil
-        }
-        svc := &corev1.Service{}
-        key := types.NamespacedName{Name: name, Namespace: cn.Namespace}
-        if err := r.Get(ctx, key, svc); err != nil {
-            return err
-        }
-        // ensure map
-        if svc.Annotations == nil {
-            svc.Annotations = map[string]string{}
-        }
-        svc.Annotations["canary.example.io/weight"] = strconv.Itoa(weight)
-        // set controller ref if not already owned
-        if !metav1.IsControlledBy(svc, cn) {
-            if err := controllerutil.SetControllerReference(cn, svc, r.Scheme); err != nil {
-                // not fatal if we can't own (e.g., existing service), proceed with patch
-            }
-        }
-        return r.Update(ctx, svc)
-    }
-    if err := patchSvc(cn.Spec.StableService, stableWeight); err != nil {
-        return err
-    }
-    if err := patchSvc(cn.Spec.CanaryService, canaryWeight); err != nil {
-        return err
-    }
-    return nil
+	stablePrevious, err := r.patchServiceWeight(ctx, cn.Namespace, cn.Spec.StableService, stableWeight)
+	if err != nil {
+		return fmt.Errorf("update stable service: %w", err)
+	}
+	if _, err := r.patchServiceWeight(ctx, cn.Namespace, cn.Spec.CanaryService, canaryWeight); err != nil {
+		rollbackErr := r.restoreServiceWeight(ctx, cn.Namespace, cn.Spec.StableService, stablePrevious)
+		if rollbackErr != nil {
+			return errors.Join(fmt.Errorf("update canary service: %w", err), fmt.Errorf("restore stable service: %w", rollbackErr))
+		}
+		return fmt.Errorf("update canary service: %w; stable service restored", err)
+	}
+	return nil
 }
 
-func (r *CanaryReconciler) fetchSLOs(ctx context.Context, cn *canaryv1.Canary) (p95 float64, errRate float64, err error) {
-    if cn.Spec.SLO.PrometheusURL == "" {
-        if env := os.Getenv("PROMETHEUS_URL"); env != "" {
-            cn.Spec.SLO.PrometheusURL = env
-        } else {
-            return 0, 0, fmt.Errorf("prometheusURL not set")
-        }
-    }
-    query := func(q string) (float64, error) {
-        if q == "" {
-            return 0, nil
-        }
-        u, _ := url.Parse(cn.Spec.SLO.PrometheusURL)
-        u.Path = "/api/v1/query"
-        qs := url.Values{}
-        qs.Set("query", q)
-        u.RawQuery = qs.Encode()
-        req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-        resp, err := r.HTTPClient.Do(req)
-        if err != nil {
-            return 0, err
-        }
-        defer resp.Body.Close()
-        var payload struct {
-            Status string `json:"status"`
-            Data   struct {
-                ResultType string `json:"resultType"`
-                Result     []struct {
-                    Value [2]any `json:"value"`
-                } `json:"result"`
-            } `json:"data"`
-        }
-        if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-            return 0, err
-        }
-        if payload.Status != "success" || len(payload.Data.Result) == 0 {
-            return 0, fmt.Errorf("no data")
-        }
-        strv, _ := payload.Data.Result[0].Value[1].(string)
-        return strconv.ParseFloat(strv, 64)
-    }
-    p95, err = query(cn.Spec.SLO.P95LatencyQuery)
-    if err != nil {
-        return 0, 0, err
-    }
-    errRate, err = query(cn.Spec.SLO.ErrorRateQuery)
-    if err != nil {
-        return 0, 0, err
-    }
-    return p95, errRate, nil
+func (r *CanaryReconciler) patchServiceWeight(ctx context.Context, namespace, name string, weight int) (annotationValue, error) {
+	svc := &corev1.Service{}
+	key := types.NamespacedName{Name: name, Namespace: namespace}
+	if err := r.Get(ctx, key, svc); err != nil {
+		return annotationValue{}, err
+	}
+	previous := annotationValue{}
+	if svc.Annotations != nil {
+		previous.value, previous.present = svc.Annotations["canary.example.io/weight"]
+	}
+	before := svc.DeepCopy()
+	if svc.Annotations == nil {
+		svc.Annotations = map[string]string{}
+	}
+	svc.Annotations["canary.example.io/weight"] = strconv.Itoa(weight)
+	if err := r.Patch(ctx, svc, client.MergeFrom(before)); err != nil {
+		return annotationValue{}, err
+	}
+	return previous, nil
+}
+
+func (r *CanaryReconciler) restoreServiceWeight(ctx context.Context, namespace, name string, previous annotationValue) error {
+	svc := &corev1.Service{}
+	key := types.NamespacedName{Name: name, Namespace: namespace}
+	if err := r.Get(ctx, key, svc); err != nil {
+		return err
+	}
+	before := svc.DeepCopy()
+	if svc.Annotations == nil {
+		svc.Annotations = map[string]string{}
+	}
+	if previous.present {
+		svc.Annotations["canary.example.io/weight"] = previous.value
+	} else {
+		delete(svc.Annotations, "canary.example.io/weight")
+	}
+	return r.Patch(ctx, svc, client.MergeFrom(before))
+}
+
+func (r *CanaryReconciler) fetchSLOs(ctx context.Context, cn *canaryv1.Canary) (float64, float64, error) {
+	if r.HTTPClient == nil {
+		return 0, 0, errors.New("HTTP client is not configured")
+	}
+	baseURL := cn.Spec.SLO.PrometheusURL
+	if baseURL == "" {
+		baseURL = os.Getenv("PROMETHEUS_URL")
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return 0, 0, fmt.Errorf("invalid Prometheus URL %q", baseURL)
+	}
+	query := func(expression string) (float64, error) {
+		if expression == "" {
+			return 0, nil
+		}
+		u := *parsed
+		u.Path = "/api/v1/query"
+		values := u.Query()
+		values.Set("query", expression)
+		u.RawQuery = values.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return 0, err
+		}
+		resp, err := r.HTTPClient.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return 0, fmt.Errorf("Prometheus returned HTTP %d", resp.StatusCode)
+		}
+		var payload struct {
+			Status string `json:"status"`
+			Data   struct {
+				Result []struct {
+					Value []any `json:"value"`
+				} `json:"result"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			return 0, fmt.Errorf("decode Prometheus response: %w", err)
+		}
+		if payload.Status != "success" || len(payload.Data.Result) == 0 || len(payload.Data.Result[0].Value) < 2 {
+			return 0, errors.New("Prometheus response contains no sample")
+		}
+		raw, ok := payload.Data.Result[0].Value[1].(string)
+		if !ok {
+			return 0, errors.New("Prometheus sample is not a string")
+		}
+		value, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0, fmt.Errorf("invalid Prometheus sample %q", raw)
+		}
+		return value, nil
+	}
+	p95, err := query(cn.Spec.SLO.P95LatencyQuery)
+	if err != nil {
+		return 0, 0, err
+	}
+	errorRate, err := query(cn.Spec.SLO.ErrorRateQuery)
+	if err != nil {
+		return 0, 0, err
+	}
+	return p95, errorRate, nil
+}
+
+func (r *CanaryReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (r *CanaryReconciler) eventf(cn *canaryv1.Canary, eventType, reason, message string, args ...any) {
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cn, eventType, reason, message, args...)
+	}
+}
+
+func setCondition(cn *canaryv1.Canary, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&cn.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             status,
+		ObservedGeneration: cn.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func conditionStatus(value bool) metav1.ConditionStatus {
+	if value {
+		return metav1.ConditionTrue
+	}
+	return metav1.ConditionFalse
 }
 
 func (r *CanaryReconciler) SetupWithManager(mgr ctrl.Manager) error {
-    return ctrl.NewControllerManagedBy(mgr).
-        For(&canaryv1.Canary{}).
-        WithOptions(controller.Options{RateLimiter: NewDefaultRateLimiter()}).
-        Complete(r)
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&canaryv1.Canary{}).
+		WithOptions(controller.Options{RateLimiter: NewDefaultRateLimiter()}).
+		Complete(r)
 }
