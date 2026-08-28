@@ -15,3 +15,15 @@ Quick Start
 - See `argocd/*` for ArgoCD Apps.
 - Apply Gatekeeper policies in `policies/gatekeeper`.
 - Run load tests from `loadtest/k6`.
+
+## Local validation
+
+The controller can be tested without a Kubernetes cluster. From `operator/`, run
+`go test ./...` and `go vet ./...`. From the repository root, run `helm lint
+charts/canary-operator` and render each directory under `config/overlays` with
+`kustomize build`.
+
+The controller samples Prometheus on every reconciliation so an SLO breach can
+roll back early, but it will not advance a rollout step until `stepInterval` has
+elapsed. Existing Services are patched by annotation and are never adopted as
+children of the Canary resource.
