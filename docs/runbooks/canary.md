@@ -16,8 +16,8 @@ CR fields
 - spec.abort: Error budget and latency increase guardrails.
 
 Common operations
-- Pause progression: remove next steps or set stepInterval to a large value; apply CR update.
-- Force rollback: set steps to [0]; operator will set canary weight 0 and stable 100 on next reconcile.
+- Pause progression: set stepInterval to a large value; the controller preserves the current step and applies the new cadence.
+- Restart with a new rollout shape: change targetRef, stableService, canaryService, or steps; the controller rolls traffic back before starting again.
 - Tune thresholds: adjust spec.slo.* and spec.abort.*; reconcile will pick up next loop.
 
 Troubleshooting
@@ -27,4 +27,3 @@ Troubleshooting
 
 SLO breach response
 - Operator sets stable 100%, canary 0% within ~one reconcile interval (<30s by default).
-

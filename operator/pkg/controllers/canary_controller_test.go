@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -108,7 +109,14 @@ func TestReconcileProgressionCadenceAndRelativeRollback(t *testing.T) {
 	defer server.Close()
 	now := time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)
 	cn := validCanary(server.URL)
-	cn.Status = canaryv1.CanaryStatus{Phase: "Pending", LastTransition: metav1.NewTime(now), ObservedGeneration: 1}
+	cn.Status = canaryv1.CanaryStatus{
+		Phase:               "Pending",
+		LastTransition:      metav1.NewTime(now),
+		ObservedGeneration:  1,
+		RolloutConfigHash:   rolloutConfigHash(cn, effectiveSteps(cn.Spec.Steps)),
+		ActiveStableService: "stable",
+		ActiveCanaryService: "canary",
+	}
 	scheme := testScheme(t)
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&canaryv1.Canary{}).WithObjects(cn, service("stable", "100"), service("canary", "0")).Build()
 	r := &CanaryReconciler{Client: baseClient, Scheme: scheme, HTTPClient: server.Client(), Now: func() time.Time { return now }}
@@ -118,14 +126,35 @@ func TestReconcileProgressionCadenceAndRelativeRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.RequeueAfter != 30*time.Second {
-		t.Fatalf("unexpected first requeue: %s", result.RequeueAfter)
+	if result.RequeueAfter != time.Second {
+		t.Fatalf("unexpected baseline requeue: %s", result.RequeueAfter)
 	}
 	current := &canaryv1.Canary{}
 	if err := baseClient.Get(context.Background(), request.NamespacedName, current); err != nil {
 		t.Fatal(err)
 	}
-	if current.Status.CurrentWeight != 10 || current.Status.CurrentStepIndex != 1 || !current.Status.BaselineCaptured || current.Status.BaselineP95Ms != 100 {
+	if current.Status.CurrentWeight != 0 || current.Status.CurrentStepIndex != 0 || !current.Status.BaselineCaptured || current.Status.BaselineP95Ms != 100 {
+		t.Fatalf("baseline was not checkpointed before progression: %+v", current.Status)
+	}
+	stableBefore := &corev1.Service{}
+	canaryBefore := &corev1.Service{}
+	_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "stable", Namespace: "default"}, stableBefore)
+	_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "canary", Namespace: "default"}, canaryBefore)
+	if stableBefore.Annotations["canary.example.io/weight"] != "100" || canaryBefore.Annotations["canary.example.io/weight"] != "0" {
+		t.Fatal("traffic changed before the baseline status was persisted")
+	}
+
+	result, err = r.Reconcile(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Fatalf("unexpected first-step requeue: %s", result.RequeueAfter)
+	}
+	if err := baseClient.Get(context.Background(), request.NamespacedName, current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.CurrentWeight != 10 || current.Status.CurrentStepIndex != 1 {
 		t.Fatalf("unexpected first-step status: %+v", current.Status)
 	}
 
@@ -162,6 +191,248 @@ func TestReconcileProgressionCadenceAndRelativeRollback(t *testing.T) {
 	if stable.Annotations["canary.example.io/weight"] != "100" || canary.Annotations["canary.example.io/weight"] != "0" {
 		t.Fatalf("rollback weights are wrong: stable=%v canary=%v", stable.Annotations, canary.Annotations)
 	}
+}
+
+type trackingClient struct {
+	client.Client
+	statusUpdates     int
+	failStatusUpdates int
+}
+
+func (c *trackingClient) Status() client.SubResourceWriter {
+	return &trackingStatusWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type trackingStatusWriter struct {
+	client.SubResourceWriter
+	client *trackingClient
+}
+
+func (w *trackingStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	w.client.statusUpdates++
+	if w.client.failStatusUpdates > 0 {
+		w.client.failStatusUpdates--
+		return fmt.Errorf("synthetic status update failure")
+	}
+	return w.SubResourceWriter.Update(ctx, obj, opts...)
+}
+
+func TestInvalidGenerationUpdatesStatusAndEmitsEventOnce(t *testing.T) {
+	cn := validCanary("http://prometheus.example")
+	cn.Spec.Steps = []int{50, 10, 100}
+	scheme := testScheme(t)
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&canaryv1.Canary{}).WithObjects(cn).Build()
+	tracked := &trackingClient{Client: baseClient}
+	recorder := record.NewFakeRecorder(10)
+	r := &CanaryReconciler{Client: tracked, Scheme: scheme, Recorder: recorder, Now: func() time.Time { return time.Unix(100, 0).UTC() }}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Name: "demo", Namespace: "default"}}
+
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	current := &canaryv1.Canary{}
+	if err := baseClient.Get(context.Background(), request.NamespacedName, current); err != nil {
+		t.Fatal(err)
+	}
+	transition := current.Status.LastTransition
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if tracked.statusUpdates != 1 {
+		t.Fatalf("invalid generation wrote status %d times", tracked.statusUpdates)
+	}
+	if len(recorder.Events) != 1 {
+		t.Fatalf("invalid generation emitted %d events", len(recorder.Events))
+	}
+	if err := baseClient.Get(context.Background(), request.NamespacedName, current); err != nil {
+		t.Fatal(err)
+	}
+	if !current.Status.LastTransition.Equal(&transition) {
+		t.Fatal("repeated invalid reconciliation changed the transition time")
+	}
+}
+
+func TestInvalidEditRollsBackUsingLastValidServices(t *testing.T) {
+	cn := validCanary("http://prometheus.example")
+	oldHash := rolloutConfigHash(cn, effectiveSteps(cn.Spec.Steps))
+	cn.Generation = 2
+	cn.Spec.StableService = "broken"
+	cn.Spec.CanaryService = "broken"
+	cn.Status = canaryv1.CanaryStatus{
+		Phase:               "Progressing",
+		CurrentStepIndex:    2,
+		CurrentWeight:       50,
+		ObservedGeneration:  1,
+		RolloutConfigHash:   oldHash,
+		ActiveStableService: "stable",
+		ActiveCanaryService: "canary",
+	}
+	scheme := testScheme(t)
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&canaryv1.Canary{}).WithObjects(cn, service("stable", "50"), service("canary", "50")).Build()
+	r := &CanaryReconciler{Client: baseClient, Scheme: scheme}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Name: "demo", Namespace: "default"}}
+
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	stable := &corev1.Service{}
+	canary := &corev1.Service{}
+	_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "stable", Namespace: "default"}, stable)
+	_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "canary", Namespace: "default"}, canary)
+	if stable.Annotations["canary.example.io/weight"] != "100" || canary.Annotations["canary.example.io/weight"] != "0" {
+		t.Fatalf("invalid edit did not roll back old services: stable=%v canary=%v", stable.Annotations, canary.Annotations)
+	}
+	current := &canaryv1.Canary{}
+	_ = baseClient.Get(context.Background(), request.NamespacedName, current)
+	if current.Status.Phase != "Invalid" || current.Status.CurrentWeight != 0 {
+		t.Fatalf("unexpected invalid status: %+v", current.Status)
+	}
+}
+
+func TestInvalidRollbackFailureRemainsRetryable(t *testing.T) {
+	cn := validCanary("http://prometheus.example")
+	cn.Spec.Steps = []int{50, 10, 100}
+	cn.Status = canaryv1.CanaryStatus{
+		Phase:               "Progressing",
+		CurrentStepIndex:    2,
+		CurrentWeight:       50,
+		ObservedGeneration:  1,
+		RolloutConfigHash:   "last-valid-config",
+		ActiveStableService: "stable",
+		ActiveCanaryService: "canary",
+	}
+	scheme := testScheme(t)
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&canaryv1.Canary{}).WithObjects(cn, service("stable", "50"), service("canary", "50")).Build()
+	failing := &failingPatchClient{Client: baseClient, failName: "canary"}
+	r := &CanaryReconciler{Client: failing, Scheme: scheme}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Name: "demo", Namespace: "default"}}
+
+	if _, err := r.Reconcile(context.Background(), request); err == nil {
+		t.Fatal("expected rollback failure")
+	}
+	current := &canaryv1.Canary{}
+	_ = baseClient.Get(context.Background(), request.NamespacedName, current)
+	if current.Status.Phase != "Invalid" || len(current.Status.Conditions) != 1 || current.Status.Conditions[0].Reason != "RollbackFailed" {
+		t.Fatalf("rollback failure was not recorded: %+v", current.Status)
+	}
+
+	failing.failName = ""
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("rollback was not retried successfully: %v", err)
+	}
+	stable := &corev1.Service{}
+	canary := &corev1.Service{}
+	_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "stable", Namespace: "default"}, stable)
+	_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "canary", Namespace: "default"}, canary)
+	if stable.Annotations["canary.example.io/weight"] != "100" || canary.Annotations["canary.example.io/weight"] != "0" {
+		t.Fatal("retry did not complete the rollback")
+	}
+}
+
+func TestBaselineStatusFailureDoesNotShiftTraffic(t *testing.T) {
+	p95, errorRate := "100", "0.001"
+	server := metricServer(t, &p95, &errorRate)
+	defer server.Close()
+	cn := validCanary(server.URL)
+	cn.Status = canaryv1.CanaryStatus{
+		Phase:               "Pending",
+		ObservedGeneration:  1,
+		RolloutConfigHash:   rolloutConfigHash(cn, effectiveSteps(cn.Spec.Steps)),
+		ActiveStableService: "stable",
+		ActiveCanaryService: "canary",
+	}
+	scheme := testScheme(t)
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&canaryv1.Canary{}).WithObjects(cn, service("stable", "100"), service("canary", "0")).Build()
+	tracked := &trackingClient{Client: baseClient, failStatusUpdates: 1}
+	r := &CanaryReconciler{Client: tracked, Scheme: scheme, HTTPClient: server.Client()}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Name: "demo", Namespace: "default"}}
+
+	if _, err := r.Reconcile(context.Background(), request); err == nil {
+		t.Fatal("expected baseline status update to fail")
+	}
+	stable := &corev1.Service{}
+	canary := &corev1.Service{}
+	_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "stable", Namespace: "default"}, stable)
+	_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "canary", Namespace: "default"}, canary)
+	if stable.Annotations["canary.example.io/weight"] != "100" || canary.Annotations["canary.example.io/weight"] != "0" {
+		t.Fatal("traffic shifted after baseline persistence failed")
+	}
+}
+
+func TestGenerationEditPolicy(t *testing.T) {
+	p95, errorRate := "100", "0.001"
+	server := metricServer(t, &p95, &errorRate)
+	defer server.Close()
+	now := time.Unix(1_000, 0).UTC()
+
+	t.Run("operational edit preserves progress", func(t *testing.T) {
+		cn := validCanary(server.URL)
+		cn.Generation = 2
+		cn.Spec.StepInterval.Duration = 10 * time.Minute
+		cn.Spec.SLO.P95LatencyMsMax = 400
+		transition := metav1.NewTime(now)
+		cn.Status = canaryv1.CanaryStatus{
+			Phase:               "Progressing",
+			CurrentStepIndex:    2,
+			CurrentWeight:       50,
+			LastTransition:      transition,
+			BaselineP95Ms:       100,
+			BaselineCaptured:    true,
+			ObservedGeneration:  1,
+			RolloutConfigHash:   rolloutConfigHash(cn, effectiveSteps(cn.Spec.Steps)),
+			ActiveStableService: "stable",
+			ActiveCanaryService: "canary",
+		}
+		scheme := testScheme(t)
+		baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&canaryv1.Canary{}).WithObjects(cn, service("stable", "50"), service("canary", "50")).Build()
+		r := &CanaryReconciler{Client: baseClient, Scheme: scheme, HTTPClient: server.Client(), Now: func() time.Time { return now }}
+		request := ctrl.Request{NamespacedName: types.NamespacedName{Name: "demo", Namespace: "default"}}
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		current := &canaryv1.Canary{}
+		_ = baseClient.Get(context.Background(), request.NamespacedName, current)
+		if current.Status.CurrentWeight != 50 || current.Status.CurrentStepIndex != 2 || !current.Status.LastTransition.Equal(&transition) || current.Status.ObservedGeneration != 2 {
+			t.Fatalf("operational edit reset progress: %+v", current.Status)
+		}
+	})
+
+	t.Run("structural edit rolls back and restarts", func(t *testing.T) {
+		cn := validCanary(server.URL)
+		oldHash := rolloutConfigHash(cn, effectiveSteps(cn.Spec.Steps))
+		cn.Generation = 2
+		cn.Spec.Steps = []int{25, 75, 100}
+		cn.Status = canaryv1.CanaryStatus{
+			Phase:               "Progressing",
+			CurrentStepIndex:    2,
+			CurrentWeight:       50,
+			BaselineP95Ms:       100,
+			BaselineCaptured:    true,
+			ObservedGeneration:  1,
+			RolloutConfigHash:   oldHash,
+			ActiveStableService: "stable",
+			ActiveCanaryService: "canary",
+		}
+		scheme := testScheme(t)
+		baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&canaryv1.Canary{}).WithObjects(cn, service("stable", "50"), service("canary", "50")).Build()
+		r := &CanaryReconciler{Client: baseClient, Scheme: scheme, HTTPClient: server.Client(), Now: func() time.Time { return now }}
+		request := ctrl.Request{NamespacedName: types.NamespacedName{Name: "demo", Namespace: "default"}}
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		current := &canaryv1.Canary{}
+		_ = baseClient.Get(context.Background(), request.NamespacedName, current)
+		if current.Status.Phase != "Pending" || current.Status.CurrentWeight != 0 || current.Status.CurrentStepIndex != 0 || current.Status.BaselineCaptured {
+			t.Fatalf("structural edit did not restart: %+v", current.Status)
+		}
+		stable := &corev1.Service{}
+		canary := &corev1.Service{}
+		_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "stable", Namespace: "default"}, stable)
+		_ = baseClient.Get(context.Background(), types.NamespacedName{Name: "canary", Namespace: "default"}, canary)
+		if stable.Annotations["canary.example.io/weight"] != "100" || canary.Annotations["canary.example.io/weight"] != "0" {
+			t.Fatal("structural edit did not roll back traffic")
+		}
+	})
 }
 
 type failingPatchClient struct {
