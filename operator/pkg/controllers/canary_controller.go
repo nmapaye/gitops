@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	canaryv1 "github.com/example/canary-operator/pkg/apis/canary/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -55,24 +57,81 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		return ctrl.Result{}, err
 	}
+	originalStatus := cn.DeepCopy().Status
 
 	steps := effectiveSteps(cn.Spec.Steps)
 	interval := effectiveInterval(cn.Spec.StepInterval.Duration)
 	if err := validateSpec(cn, steps, interval); err != nil {
+		if cn.Status.Phase == "Invalid" && cn.Status.ObservedGeneration == cn.Generation && cn.Status.Message == err.Error() {
+			return ctrl.Result{}, nil
+		}
+		transitioned := cn.Status.Phase != "Invalid" || cn.Status.ObservedGeneration != cn.Generation
+		if cn.Status.RolloutConfigHash != "" {
+			stableService, canaryService, ok := activeServices(cn)
+			if ok {
+				if rollbackErr := r.applyServiceWeightsForServices(ctx, cn.Namespace, stableService, canaryService, 100, 0); rollbackErr != nil {
+					cn.Status.Phase = "Invalid"
+					cn.Status.Message = fmt.Sprintf("Invalid spec; rollback failed: %v", rollbackErr)
+					cn.Status.ObservedGeneration = cn.Generation
+					if transitioned {
+						cn.Status.LastTransition = metav1.NewTime(r.now())
+					}
+					setCondition(cn, metav1.ConditionFalse, "RollbackFailed", cn.Status.Message)
+					if statusErr := r.updateStatus(ctx, cn, originalStatus); statusErr != nil {
+						return ctrl.Result{}, errors.Join(rollbackErr, statusErr)
+					}
+					return ctrl.Result{}, rollbackErr
+				}
+				cn.Status.CurrentWeight = 0
+			}
+		}
 		cn.Status.Phase = "Invalid"
 		cn.Status.Message = err.Error()
 		cn.Status.ObservedGeneration = cn.Generation
-		cn.Status.LastTransition = metav1.NewTime(r.now())
+		if transitioned {
+			cn.Status.LastTransition = metav1.NewTime(r.now())
+		}
 		setCondition(cn, metav1.ConditionFalse, "InvalidSpec", err.Error())
-		if statusErr := r.Status().Update(ctx, cn); statusErr != nil {
+		if statusErr := r.updateStatus(ctx, cn, originalStatus); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		r.eventf(cn, corev1.EventTypeWarning, "InvalidSpec", "%v", err)
 		return ctrl.Result{}, nil
 	}
 
-	if cn.Status.ObservedGeneration != 0 && cn.Status.ObservedGeneration != cn.Generation {
-		cn.Status = canaryv1.CanaryStatus{Phase: "Pending", LastTransition: metav1.NewTime(r.now())}
+	configHash := rolloutConfigHash(cn, steps)
+	checkpointConfig := false
+	if cn.Status.RolloutConfigHash == "" {
+		cn.Status.RolloutConfigHash = configHash
+		cn.Status.ActiveStableService = cn.Spec.StableService
+		cn.Status.ActiveCanaryService = cn.Spec.CanaryService
+		checkpointConfig = cn.Status.Phase != ""
+	} else if cn.Status.RolloutConfigHash != configHash {
+		stableService, canaryService, ok := activeServices(cn)
+		if ok {
+			if err := r.applyServiceWeightsForServices(ctx, cn.Namespace, stableService, canaryService, 100, 0); err != nil {
+				cn.Status.Message = fmt.Sprintf("Rollback failed before rollout restart: %v", err)
+				setCondition(cn, metav1.ConditionFalse, "RollbackFailed", cn.Status.Message)
+				if statusErr := r.updateStatus(ctx, cn, originalStatus); statusErr != nil {
+					return ctrl.Result{}, errors.Join(err, statusErr)
+				}
+				return ctrl.Result{}, err
+			}
+		}
+		cn.Status = canaryv1.CanaryStatus{
+			Phase:               "Pending",
+			LastTransition:      metav1.NewTime(r.now()),
+			Message:             "Rollout configuration changed; waiting for a new baseline",
+			ObservedGeneration:  cn.Generation,
+			RolloutConfigHash:   configHash,
+			ActiveStableService: cn.Spec.StableService,
+			ActiveCanaryService: cn.Spec.CanaryService,
+		}
+		setCondition(cn, metav1.ConditionFalse, "Pending", cn.Status.Message)
+		if err := r.updateStatus(ctx, cn, originalStatus); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	cn.Status.ObservedGeneration = cn.Generation
 
@@ -81,7 +140,13 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		cn.Status.LastTransition = metav1.NewTime(r.now())
 		cn.Status.Message = "Waiting for initial SLO sample"
 		setCondition(cn, metav1.ConditionFalse, "Pending", cn.Status.Message)
-		if err := r.Status().Update(ctx, cn); err != nil {
+		if err := r.updateStatus(ctx, cn, originalStatus); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	if checkpointConfig {
+		if err := r.updateStatus(ctx, cn, originalStatus); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: time.Second}, nil
@@ -92,7 +157,7 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		logger.Error(err, "failed fetching SLO metrics")
 		cn.Status.Message = "Prometheus query failed"
 		setCondition(cn, metav1.ConditionFalse, "PromQueryError", cn.Status.Message)
-		if statusErr := r.Status().Update(ctx, cn); statusErr != nil {
+		if statusErr := r.updateStatus(ctx, cn, originalStatus); statusErr != nil {
 			return ctrl.Result{}, errors.Join(err, statusErr)
 		}
 		r.eventf(cn, corev1.EventTypeWarning, "PromQueryError", "Failed to fetch SLOs: %v", err)
@@ -103,6 +168,13 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if !cn.Status.BaselineCaptured {
 		cn.Status.BaselineP95Ms = p95
 		cn.Status.BaselineCaptured = true
+		cn.Status.ErrorBudgetRem = errorBudgetRemaining(errRate, cn.Spec.SLO.ErrorRateMax)
+		cn.Status.Message = "Initial SLO baseline captured"
+		setCondition(cn, metav1.ConditionFalse, "BaselineCaptured", cn.Status.Message)
+		if err := r.updateStatus(ctx, cn, originalStatus); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	cn.Status.ErrorBudgetRem = errorBudgetRemaining(errRate, cn.Spec.SLO.ErrorRateMax)
 
@@ -110,7 +182,7 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if err := r.applyServiceWeights(ctx, cn, 100, 0); err != nil {
 			cn.Status.Message = fmt.Sprintf("Rollback failed after SLO breach: %v", err)
 			setCondition(cn, metav1.ConditionFalse, "RollbackFailed", cn.Status.Message)
-			if statusErr := r.Status().Update(ctx, cn); statusErr != nil {
+			if statusErr := r.updateStatus(ctx, cn, originalStatus); statusErr != nil {
 				return ctrl.Result{}, errors.Join(err, statusErr)
 			}
 			return ctrl.Result{}, err
@@ -121,7 +193,7 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		cn.Status.LastTransition = metav1.NewTime(r.now())
 		setCondition(cn, metav1.ConditionFalse, "SLOBreach", cn.Status.Message)
 		r.eventf(cn, corev1.EventTypeWarning, "Rollback", "%s", cn.Status.Message)
-		if err := r.Status().Update(ctx, cn); err != nil {
+		if err := r.updateStatus(ctx, cn, originalStatus); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: longRequeue}, nil
@@ -129,7 +201,7 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	if cn.Status.Phase == "Failed" || cn.Status.Phase == "Succeeded" {
 		setCondition(cn, conditionStatus(cn.Status.Phase == "Succeeded"), cn.Status.Phase, cn.Status.Message)
-		if err := r.Status().Update(ctx, cn); err != nil {
+		if err := r.updateStatus(ctx, cn, originalStatus); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: longRequeue}, nil
@@ -139,7 +211,7 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		nextStepAt := cn.Status.LastTransition.Time.Add(interval)
 		if remaining := nextStepAt.Sub(r.now()); remaining > 0 {
 			setCondition(cn, metav1.ConditionFalse, "WaitingForStep", "Waiting for the configured step interval")
-			if err := r.Status().Update(ctx, cn); err != nil {
+			if err := r.updateStatus(ctx, cn, originalStatus); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{RequeueAfter: remaining}, nil
@@ -151,7 +223,7 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		cn.Status.Message = "Reached final weight"
 		cn.Status.LastTransition = metav1.NewTime(r.now())
 		setCondition(cn, metav1.ConditionTrue, "Succeeded", cn.Status.Message)
-		if err := r.Status().Update(ctx, cn); err != nil {
+		if err := r.updateStatus(ctx, cn, originalStatus); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: longRequeue}, nil
@@ -161,7 +233,7 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err := r.applyServiceWeights(ctx, cn, 100-targetWeight, targetWeight); err != nil {
 		cn.Status.Message = fmt.Sprintf("Traffic update failed: %v", err)
 		setCondition(cn, metav1.ConditionFalse, "TrafficUpdateFailed", cn.Status.Message)
-		if statusErr := r.Status().Update(ctx, cn); statusErr != nil {
+		if statusErr := r.updateStatus(ctx, cn, originalStatus); statusErr != nil {
 			return ctrl.Result{}, errors.Join(err, statusErr)
 		}
 		return ctrl.Result{}, err
@@ -180,7 +252,7 @@ func (r *CanaryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		setCondition(cn, metav1.ConditionFalse, "Progressing", cn.Status.Message)
 	}
 	r.eventf(cn, corev1.EventTypeNormal, "Progress", "%s", cn.Status.Message)
-	if err := r.Status().Update(ctx, cn); err != nil {
+	if err := r.updateStatus(ctx, cn, originalStatus); err != nil {
 		return ctrl.Result{}, err
 	}
 	if targetWeight == 100 {
@@ -201,6 +273,30 @@ func effectiveInterval(configured time.Duration) time.Duration {
 		return defaultStepInterval
 	}
 	return configured
+}
+
+func rolloutConfigHash(cn *canaryv1.Canary, steps []int) string {
+	payload, _ := json.Marshal(struct {
+		TargetRef     string `json:"targetRef"`
+		StableService string `json:"stableService"`
+		CanaryService string `json:"canaryService"`
+		Steps         []int  `json:"steps"`
+	}{
+		TargetRef:     cn.Spec.TargetRef,
+		StableService: cn.Spec.StableService,
+		CanaryService: cn.Spec.CanaryService,
+		Steps:         steps,
+	})
+	return fmt.Sprintf("%x", sha256.Sum256(payload))
+}
+
+func activeServices(cn *canaryv1.Canary) (string, string, bool) {
+	stableService := cn.Status.ActiveStableService
+	canaryService := cn.Status.ActiveCanaryService
+	if stableService == "" || canaryService == "" || stableService == canaryService {
+		return "", "", false
+	}
+	return stableService, canaryService, true
 }
 
 func validateSpec(cn *canaryv1.Canary, steps []int, interval time.Duration) error {
@@ -280,18 +376,29 @@ type annotationValue struct {
 }
 
 func (r *CanaryReconciler) applyServiceWeights(ctx context.Context, cn *canaryv1.Canary, stableWeight, canaryWeight int) error {
-	stablePrevious, err := r.patchServiceWeight(ctx, cn.Namespace, cn.Spec.StableService, stableWeight)
+	return r.applyServiceWeightsForServices(ctx, cn.Namespace, cn.Spec.StableService, cn.Spec.CanaryService, stableWeight, canaryWeight)
+}
+
+func (r *CanaryReconciler) applyServiceWeightsForServices(ctx context.Context, namespace, stableService, canaryService string, stableWeight, canaryWeight int) error {
+	stablePrevious, err := r.patchServiceWeight(ctx, namespace, stableService, stableWeight)
 	if err != nil {
 		return fmt.Errorf("update stable service: %w", err)
 	}
-	if _, err := r.patchServiceWeight(ctx, cn.Namespace, cn.Spec.CanaryService, canaryWeight); err != nil {
-		rollbackErr := r.restoreServiceWeight(ctx, cn.Namespace, cn.Spec.StableService, stablePrevious)
+	if _, err := r.patchServiceWeight(ctx, namespace, canaryService, canaryWeight); err != nil {
+		rollbackErr := r.restoreServiceWeight(ctx, namespace, stableService, stablePrevious)
 		if rollbackErr != nil {
 			return errors.Join(fmt.Errorf("update canary service: %w", err), fmt.Errorf("restore stable service: %w", rollbackErr))
 		}
 		return fmt.Errorf("update canary service: %w; stable service restored", err)
 	}
 	return nil
+}
+
+func (r *CanaryReconciler) updateStatus(ctx context.Context, cn *canaryv1.Canary, before canaryv1.CanaryStatus) error {
+	if apiequality.Semantic.DeepEqual(before, cn.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, cn)
 }
 
 func (r *CanaryReconciler) patchServiceWeight(ctx context.Context, namespace, name string, weight int) (annotationValue, error) {

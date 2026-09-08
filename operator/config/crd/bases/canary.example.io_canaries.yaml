@@ -100,6 +100,12 @@ spec:
                 observedGeneration:
                   type: integer
                   format: int64
+                rolloutConfigHash:
+                  type: string
+                activeStableService:
+                  type: string
+                activeCanaryService:
+                  type: string
                 conditions:
                   type: array
                   x-kubernetes-list-type: map

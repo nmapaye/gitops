@@ -44,18 +44,21 @@ type AbortRules struct {
 
 // CanaryStatus defines the observed state of Canary
 type CanaryStatus struct {
-	Phase              string             `json:"phase,omitempty"`
-	CurrentStepIndex   int                `json:"currentStepIndex,omitempty"`
-	CurrentWeight      int                `json:"currentWeight,omitempty"`
-	LastTransition     metav1.Time        `json:"lastTransition,omitempty"`
-	Message            string             `json:"message,omitempty"`
-	ErrorBudgetRem     float64            `json:"errorBudgetRemaining,omitempty"`
-	P95LatencyMs       float64            `json:"p95LatencyMs,omitempty"`
-	ErrorRate          float64            `json:"errorRate,omitempty"`
-	BaselineP95Ms      float64            `json:"baselineP95Ms,omitempty"`
-	BaselineCaptured   bool               `json:"baselineCaptured,omitempty"`
-	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
-	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	Phase               string             `json:"phase,omitempty"`
+	CurrentStepIndex    int                `json:"currentStepIndex,omitempty"`
+	CurrentWeight       int                `json:"currentWeight,omitempty"`
+	LastTransition      metav1.Time        `json:"lastTransition,omitempty"`
+	Message             string             `json:"message,omitempty"`
+	ErrorBudgetRem      float64            `json:"errorBudgetRemaining,omitempty"`
+	P95LatencyMs        float64            `json:"p95LatencyMs,omitempty"`
+	ErrorRate           float64            `json:"errorRate,omitempty"`
+	BaselineP95Ms       float64            `json:"baselineP95Ms,omitempty"`
+	BaselineCaptured    bool               `json:"baselineCaptured,omitempty"`
+	ObservedGeneration  int64              `json:"observedGeneration,omitempty"`
+	RolloutConfigHash   string             `json:"rolloutConfigHash,omitempty"`
+	ActiveStableService string             `json:"activeStableService,omitempty"`
+	ActiveCanaryService string             `json:"activeCanaryService,omitempty"`
+	Conditions          []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true

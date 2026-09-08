@@ -9,6 +9,8 @@ spec:
     listKind: CanaryList
     plural: canaries
     singular: canary
+    shortNames:
+      - cnry
   scope: Namespaced
   versions:
     - name: v1alpha1
@@ -20,19 +22,32 @@ spec:
           properties:
             spec:
               type: object
+              required:
+                - targetRef
+                - stableService
+                - canaryService
+                - slo
               properties:
                 targetRef:
                   type: string
+                  minLength: 1
                 stableService:
                   type: string
+                  minLength: 1
                 canaryService:
                   type: string
+                  minLength: 1
                 steps:
                   type: array
+                  default: [10, 50, 100]
+                  minItems: 1
                   items:
                     type: integer
+                    minimum: 1
+                    maximum: 100
                 stepInterval:
                   type: string
+                  default: 30s
                 slo:
                   type: object
                   properties:
@@ -44,15 +59,81 @@ spec:
                       type: string
                     p95LatencyMsMax:
                       type: number
+                      minimum: 0
                     errorRateMax:
                       type: number
+                      minimum: 0
+                      maximum: 1
                 abort:
                   type: object
                   properties:
                     minErrorBudgetPercent:
                       type: number
+                      minimum: 0
+                      maximum: 100
                     maxP95IncreaseMs:
                       type: number
+                      minimum: 0
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                currentStepIndex:
+                  type: integer
+                currentWeight:
+                  type: integer
+                lastTransition:
+                  type: string
+                message:
+                  type: string
+                errorBudgetRemaining:
+                  type: number
+                p95LatencyMs:
+                  type: number
+                errorRate:
+                  type: number
+                baselineP95Ms:
+                  type: number
+                baselineCaptured:
+                  type: boolean
+                observedGeneration:
+                  type: integer
+                  format: int64
+                rolloutConfigHash:
+                  type: string
+                activeStableService:
+                  type: string
+                activeCanaryService:
+                  type: string
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys:
+                    - type
+                  items:
+                    type: object
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    properties:
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      reason:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      type:
+                        type: string
       subresources:
         status: {}
-
